@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IntiBank - Core Banking Transaction Processing API
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: intibank-txn-processor-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TransactionProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: intibank-txn-processor
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json, random, time
+
+          def handler(event, context):
+              qs = event.get("queryStringParameters") or {}
+              mode = qs.get("mode", "random")
+
+              if mode == "error" or (mode == "random" and random.random() < 0.6):
+                  raise RuntimeError("Transaction failed: core ledger service unreachable")
+
+              if mode == "slow":
+                  time.sleep(8)
+
+              return {"statusCode": 200, "body": json.dumps({"status": "ok", "txn_id": "TXN-29847"})}
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransactionProcessor
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: intibank-api
+      ProtocolType: HTTP
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt TransactionProcessor.Arn
+      PayloadFormatVersion: '2.0'
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  TxnErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: intibank-txn-errors
+      AlarmDescription: Transaction processing failures exceeded threshold - potential core ledger outage
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransactionProcessor
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  TxnLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: intibank-txn-high-latency
+      AlarmDescription: Transaction latency exceeds SLA - customer impact likely
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransactionProcessor
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  OpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: intibank-transactions-ops
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Transaction Errors",
+                "metrics": [["AWS/Lambda","Errors","FunctionName","${TransactionProcessor}",{"stat":"Sum","color":"#d62728"}]],
+                "period": 60, "region": "${AWS::Region}", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Transaction Latency (ms)",
+                "metrics": [
+                  ["AWS/Lambda","Duration","FunctionName","${TransactionProcessor}",{"stat":"Average","color":"#ff7f0e"}],
+                  ["AWS/Lambda","Duration","FunctionName","${TransactionProcessor}",{"stat":"p99","color":"#d62728"}]
+                ],
+                "period": 60, "region": "${AWS::Region}", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Transactions Processed vs Failed",
+                "metrics": [
+                  ["AWS/Lambda","Invocations","FunctionName","${TransactionProcessor}",{"stat":"Sum","color":"#2ca02c"}],
+                  ["AWS/Lambda","Errors","FunctionName","${TransactionProcessor}",{"stat":"Sum","color":"#d62728"}]
+                ],
+                "period": 60, "region": "${AWS::Region}", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "alarm", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Alarm Status",
+                "alarms": ["${TxnErrorAlarm.Arn}","${TxnLatencyAlarm.Arn}"]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  FunctionName:
+    Value: !Ref TransactionProcessor
+  ErrorAlarmName:
+    Value: !Ref TxnErrorAlarm

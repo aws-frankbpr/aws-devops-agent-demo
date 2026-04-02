@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IntiBank - Incident Response Bridge (CloudWatch Alarm to DevOps Agent)
+
+Parameters:
+  AgentSpaceId:
+    Type: String
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: intibank-incident-bridge
+
+  BridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: intibank-incident-bridge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DevOpsAgentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aidevops:CreateBacklogTask
+                  - aidevops:ListBacklogTasks
+                Resource: !Sub "arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/${AgentSpaceId}"
+
+  BridgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: intibank-incident-bridge
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt BridgeRole.Arn
+      Environment:
+        Variables:
+          AGENT_SPACE_ID: !Ref AgentSpaceId
+      Code:
+        ZipFile: |
+          import json, os
+          from botocore.session import Session
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from urllib.request import urlopen, Request
+
+          SPACE = os.environ["AGENT_SPACE_ID"]
+          REGION = "us-east-1"
+          ENDPOINT = f"https://dp.aidevops.{REGION}.api.aws"
+          session = Session()
+          credentials = session.get_credentials()
+
+          def signed_request(method, path, body_dict):
+              url = f"{ENDPOINT}{path}"
+              body = json.dumps(body_dict)
+              req = AWSRequest(method=method, url=url, data=body, headers={"Content-Type": "application/json"})
+              SigV4Auth(credentials, "aidevops", REGION).add_auth(req)
+              http_req = Request(url, data=body.encode(), headers=dict(req.headers), method=method)
+              with urlopen(http_req) as resp:
+                  return json.loads(resp.read())
+
+          def handler(event, context):
+              for record in event["Records"]:
+                  msg = json.loads(record["Sns"]["Message"])
+                  alarm = msg.get("AlarmName", "Unknown")
+                  reason = msg.get("NewStateReason", "")
+                  acct = msg.get("AWSAccountId", "")
+                  region = msg.get("Region", "")
+                  desc = msg.get("AlarmDescription", "")
+                  trigger = msg.get("Trigger", {})
+                  dims = trigger.get("Dimensions", [])
+                  dim_str = ", ".join(f'{d["name"]}={d["value"]}' for d in dims)
+
+                  title = f"Alarm: {alarm}"
+                  body = (
+                      f"CloudWatch alarm '{alarm}' entered ALARM state.\n"
+                      f"Reason: {reason}\n"
+                      f"Description: {desc}\n"
+                      f"Resources: {dim_str}\n"
+                      f"Account: {acct}, Region: {region}\n"
+                      f"Investigate root cause and provide mitigation."
+                  )
+
+                  resp = signed_request("POST", f"/backlog/agent-space/{SPACE}/tasks", {
+                      "taskType": "INVESTIGATION",
+                      "title": title[:400],
+                      "description": body[:2000],
+                      "priority": "HIGH",
+                  })
+                  task_id = resp.get("task", {}).get("taskId", "unknown")
+                  print(f"Created investigation {task_id} for alarm {alarm}")
+
+              return {"status": "ok"}
+
+  SnsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BridgeFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlarmTopic
+
+  SnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: lambda
+      Endpoint: !GetAtt BridgeFunction.Arn
+
+Outputs:
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic

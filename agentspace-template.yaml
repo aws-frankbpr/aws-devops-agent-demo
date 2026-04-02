@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IntiBank - DevOps Agent Space with operator portal and AWS account association
+
+Resources:
+
+  # --- Agent Space ---
+  AgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    Properties:
+      Name: IntiBank-Production
+      Description: Core banking platform - transaction processing, incident response and reliability engineering
+      OperatorApp:
+        Iam:
+          OperatorAppRoleArn: !GetAtt OperatorRole.Arn
+
+  # --- IAM Role: Operator Portal ---
+  OperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: intibank-operator-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*"
+      Policies:
+        - PolicyName: OperatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aidevops:GetAgentSpace
+                  - aidevops:ListAssociations
+                  - aidevops:CreateBacklogTask
+                  - aidevops:GetBacklogTask
+                  - aidevops:ListBacklogTasks
+                  - aidevops:ListJournalRecords
+                  - aidevops:ListExecutions
+                  - aidevops:ListRecommendations
+                  - aidevops:GetRecommendation
+                  - aidevops:InvokeAgent
+                  - aidevops:SendChatMessage
+                  - aidevops:ListPendingMessages
+                Resource: !Sub "arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*"
+
+  # --- IAM Role: Resource Introspection ---
+  AgentSpaceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: intibank-agentspace-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIOpsAssistantPolicy
+
+  # --- AWS Account Association ---
+  AwsAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Properties:
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      ServiceId: aws
+      Configuration:
+        Aws:
+          AccountId: !Ref AWS::AccountId
+          AccountType: monitor
+          AssumableRoleArn: !GetAtt AgentSpaceRole.Arn
+
+Outputs:
+  AgentSpaceId:
+    Description: Agent Space ID for use with the incident bridge
+    Value: !GetAtt AgentSpace.AgentSpaceId
+  AgentSpaceArn:
+    Description: Agent Space ARN
+    Value: !GetAtt AgentSpace.Arn
